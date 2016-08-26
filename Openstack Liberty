@@ -1,0 +1,1023 @@
+Openstack Liberty 基础环境
+
+环境规划
+  
+  主机信息
+      2 VMware VMs, 4 CPU, 4G MEM, 2 NICs(NAT、Host-only), 2 DISKs(system、data)
+  IP 规划
+      controller  192.168.56.11
+      compute     192.168.56.12
+      
+NTP 时间服务器
+
+  /etc/chronyd.conf 修改chrony服务配置文件
+  controller:
+      server 192.168.56.11 iburst
+      allow 192.168.56.0/24
+      
+  compute:
+      server 192.168.56.11 iburst
+      # iburst：当一个运程NTP服务器不可用时，向它发送一系列的并发包进行检测
+      
+  restart chrony(all nodes)
+      systemctl restart chronyd.service
+      
+  verify chrony(all nodes) 验证
+      chronyc sources
+      
+Enable Openstack repository 安装 Openstack-liberty 源
+
+    yum install centos-release-openstack-liberty
+    yum install python-openstackclient
+    yum install openstack-selinux
+    yum upgrade
+    
+SQL database --- store infomation for most Openstack services
+
+  installation
+    yum install mariadb mariadb-server python2-PyMySQL
+  
+  start mariadb
+    systemctl enable mariadb.service
+    systemctl start mariadb.service
+    mysql_secure_installation 初始化mariadb环境
+
+NoSQL database --- store information for Telemetry service
+
+  installation
+    yum install mongodb-server mongodb (Telemetry service only)
+  
+  /etc/mongod.conf
+    bind_ip = 192.168.56.11
+    By default, MongoDB creates several 1 GB journal files in the /var/lib/mongodb/journal directory. If you want to reduce the size of each journal file to 128 MB and limit total journal space consumption to 512 MB, assert the smallfiles key: smallfiles = true
+  
+  start
+    systemctl enable mongod.service
+    systemctl start mongod.service
+
+Message queue --- coordinate operations and status information among services
+
+  installation
+    yum install rabbitmq-server
+  start
+    systemct enable rabbitmq-server.service
+    systemctl start rabbitmq-server.service
+    /usr/sbin/rabbitmq-plugins enable rabbitmq_management(开启RabbitMQ管理插件，便于通过浏览器管理RabbitMQ)
+  
+  add openstack user
+    rabbitmqctl add_user openstack openstack
+  
+  set access permission for the openstack user
+    rabbitmqctl set_permissions openstack ".*" ".*" ".*"
+    systemctl restart rabbitmq-server
+
+Memcached --- cache Keystone tokens
+
+  installation
+    yum install memcached python-memcached
+  start
+    systemctl enable memcached.service
+    systemctl start memcached.service
+
+
+Openstack Liberty 基础组件安装
+
+Keystone service
+
+  install and configure components
+    yum install openstack-keystone httpd mod_wsgi
+    
+  create database and admin token
+    mysql -u root -p
+    CREATE DATABASE keystone;
+    GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'localhost' IDENTIFIED BY 'keystone';
+    GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'%' IDENTIFIED BY 'keystone';
+    ---> Generate a random value to use as the administration token during initial configuration
+    openssl rand -hex 10  ---> admin_token
+    --->  用户可以通过user-password或者token的方式访问openstack的服务, 初始安装keystone服务后，由于没有用户，只能通过token的方式访问.
+    /etc/keystone/keystone.conf
+  In the [DEFAULT] section, define the value of the initial administration token:
+  
+  [DEFAULT]
+    admin_token = e8d5bddc118443abefdb
+    verbose = true
+  
+  [database]
+    connection = mysql://keystone:keystone@192.168.56.11/keystone
+  
+  [memcache]
+    servers = localhost:11211
+  
+  [revoke]
+    driver = sql
+  
+  [token]
+    provider = uuid
+    driver = memcache
+  
+  Populate the Identity service database: 同步数据库
+    su -s /bin/sh -c "keystone-manage db_sync" keystone
+  /etc/httpd/conf/httpd.conf
+    ServerName 192.168.56.11
+  /etc/httpd/conf.d/wsgi-keystone.conf
+    Listen 5000
+    Listen 35357
+    
+    <VirtualHost *:5000>
+        WSGIDaemonProcess keystone-public processes=5 threads=1 user=keystone group=keystone display-name=%{GROUP}
+        WSGIProcessGroup keystone-public
+        WSGIScriptAlias / /usr/bin/keystone-wsgi-public
+        WSGIApplicationGroup %{GLOBAL}
+        WSGIPassAuthorization On
+        <IfVersion >= 2.4>
+          ErrorLogFormat "%{cu}t %M"
+        </IfVersion>
+        ErrorLog /var/log/httpd/keystone-error.log
+        CustomLog /var/log/httpd/keystone-access.log combined
+  
+        <Directory /usr/bin>
+            <IfVersion >= 2.4>
+                Require all granted
+            </IfVersion>
+            <IfVersion < 2.4>
+                Order allow,deny
+                Allow from all
+            </IfVersion>
+        </Directory>
+    </VirtualHost>
+  
+    <VirtualHost *:35357>
+        WSGIDaemonProcess keystone-admin processes=5 threads=1 user=keystone group=keystone display-name=%{GROUP}
+        WSGIProcessGroup keystone-admin
+        WSGIScriptAlias / /usr/bin/keystone-wsgi-admin
+        WSGIApplicationGroup %{GLOBAL}
+        WSGIPassAuthorization On
+        <IfVersion >= 2.4>
+          ErrorLogFormat "%{cu}t %M"
+        </IfVersion>
+        ErrorLog /var/log/httpd/keystone-error.log
+        CustomLog /var/log/httpd/keystone-access.log combined
+  
+        <Directory /usr/bin>
+            <IfVersion >= 2.4>
+                Require all granted
+            </IfVersion>
+            <IfVersion < 2.4>
+                Order allow,deny
+                Allow from all
+            </IfVersion>
+        </Directory>
+    </VirtualHost>
+  start
+    systemctl enable httpd.service
+    systemctl start httpd.service
+  create the service entity adn API endpoints
+  vim pre-src.sh
+      export OS_TOKEN=e8d5bddc118443abefdb
+      export OS_URL=http://192.168.56.11:35357/v3
+      export OS_IDENTITY_API_VERSION=3
+      
+  source pre-src.sh
+  
+  # create service and endpoint API of Keystone
+  openstack service create --name keystone --description "OpenStack Identity" identity
+  +-------------+----------------------------------+
+  | Field       | Value                            |
+  +-------------+----------------------------------+
+  | description | OpenStack Identity               |
+  | enabled     | True                             |
+  | id          | df6145d3a6a642bd87324a10760984c5 |
+  | name        | keystone                         |
+  | type        | identity                         |
+  +-------------+----------------------------------+
+  
+      
+  openstack endpoint create --region RegionOne identity public http://192.168.56.11:5000/v2.0
+  +--------------+----------------------------------+
+  | Field        | Value                            |
+  +--------------+----------------------------------+
+  | enabled      | True                             |
+  | id           | a5227a0795904355ad64cace758b4614 |
+  | interface    | public                           |
+  | region       | RegionOne                        |
+  | region_id    | RegionOne                        |
+  | service_id   | df6145d3a6a642bd87324a10760984c5 |
+  | service_name | keystone                         |
+  | service_type | identity                         |
+  | url          | http://192.168.56.11:5000/v2.0   |
+  +--------------+----------------------------------+
+  openstack endpoint create --region RegionOne identity internal http://192.168.56.11:5000/v2.0
+  +--------------+----------------------------------+
+  | Field        | Value                            |
+  +--------------+----------------------------------+
+  | enabled      | True                             |
+  | id           | 1b3c6813acdf45de92bae2a7e9fe7771 |
+  | interface    | internal                         |
+  | region       | RegionOne                        |
+  | region_id    | RegionOne                        |
+  | service_id   | df6145d3a6a642bd87324a10760984c5 |
+  | service_name | keystone                         |
+  | service_type | identity                         |
+  | url          | http://192.168.56.11:5000/v2.0   |
+  +--------------+----------------------------------+
+  openstack endpoint create --region RegionOne identity admin http://192.168.56.11:35357/v2.0
+  +--------------+----------------------------------+
+  | Field        | Value                            |
+  +--------------+----------------------------------+
+  | enabled      | True                             |
+  | id           | dcee65e22ae045fca16b6a29b9af55a1 |
+  | interface    | admin                            |
+  | region       | RegionOne                        |
+  | region_id    | RegionOne                        |
+  | service_id   | df6145d3a6a642bd87324a10760984c5 |
+  | service_name | keystone                         |
+  | service_type | identity                         |
+  | url          | http://192.168.56.11:35357/v2.0  |
+  +--------------+----------------------------------+
+  
+  
+  # service entry and endpoint API
+  
+      The Identity service manages a catalog of API endpoints associated with the services in your OpenStack environment. Services use this catalog to determine how to communicate with other services in your environment.
+  
+      OpenStack uses three API endpoint variants for each service: admin, internal, and public. 
+      
+      The admin API endpoint allows modifying users and tenants by default, while the public and internal APIs do not allow these operations. 
+      
+      For instance, the public API network might be visible from the Internet so customers can manage their clouds. 
+      
+      The admin API network might be restricted to operators within the organization that manages cloud infrastructure. 
+      
+      The internal API network might be restricted to the hosts that contain OpenStack services. Also, OpenStack supports multiple regions for scalability. 
+  
+      Each service that you add to your OpenStack environment requires one or more service entities and three API endpoint variants in the Identity service.
+  create a domain, project, users and roles
+  # domain|-->project
+          |-->user
+          |-->role
+  # 不同的user在不同的project中可以被赋予不同的role   
+  
+  # Create an administrative project, user, and role for administrative operations in your environment   
+  
+  openstack project create --domain default --description "Admin Project" admin
+  +-------------+----------------------------------+
+  | Field       | Value                            |
+  +-------------+----------------------------------+
+  | description | Admin Project                    |
+  | domain_id   | 87c15d93437c41e4b43b1658bfbdfd63 |
+  | enabled     | True                             |
+  | id          | 6b0301e383214f1f96fdf3ea0d244a82 |
+  | is_domain   | False                            |
+  | name        | admin                            |
+  | parent_id   | 87c15d93437c41e4b43b1658bfbdfd63 |
+  +-------------+----------------------------------+
+  openstack user create --domain default --password-prompt admin
+  User Password:
+  Repeat User Password:
+  +-----------+----------------------------------+
+  | Field     | Value                            |
+  +-----------+----------------------------------+
+  | domain_id | 87c15d93437c41e4b43b1658bfbdfd63 |
+  | enabled   | True                             |
+  | id        | 0e91c50f435a4b5db0336c3d383c1970 |
+  | name      | admin                            |
+  +-----------+----------------------------------+
+  openstack role create admin
+  +-----------+----------------------------------+
+  | Field     | Value                            |
+  +-----------+----------------------------------+
+  | domain_id | None                             |
+  | id        | 116e91425a5e4b909564a7198141e097 |
+  | name      | admin                            |
+  +-----------+----------------------------------+
+  
+  openstack role add --project admin --user admin admin
+  This guide uses a service project that contains a unique user for each service that you add to your environment. Create the service project
+  # 每个服务的用户都属于这个project ---> service
+  
+  openstack project create --domain default --description "Service Project" service
+  +-------------+----------------------------------+
+  | Field       | Value                            |
+  +-------------+----------------------------------+
+  | description | Service Project                  |
+  | domain_id   | 87c15d93437c41e4b43b1658bfbdfd63 |
+  | enabled     | True                             |
+  | id          | cc310421867f4ed697d60d5ec5c75b4b |
+  | is_domain   | False                            |
+  | name        | service                          |
+  | parent_id   | 87c15d93437c41e4b43b1658bfbdfd63 |
+  +-------------+----------------------------------+    
+  
+  
+  -- Regular (non-admin) tasks should use an unprivileged project and user. As an example, this guide creates the demo project and user.
+  
+  openstack project create --domain default --description "Demo Project" demo
+  +-------------+----------------------------------+
+  | Field       | Value                            |
+  +-------------+----------------------------------+
+  | description | Demo Project                     |
+  | domain_id   | default                          |
+  | enabled     | True                             |
+  | id          | fa717be3a6b24b75bc0248912d22a53d |
+  | is_domain   | False                            |
+  | name        | demo                             |
+  | parent_id   | None                             |
+  +-------------+----------------------------------+
+  openstack user create --domain default --password-prompt user
+  +-----------+----------------------------------+
+  | Field     | Value                            |
+  +-----------+----------------------------------+
+  | domain_id | default                          |
+  | enabled   | True                             |
+  | id        | 48733b528bec4928beea0346ee3a11d0 |
+  | name      | demo                             |
+  +-----------+----------------------------------+
+  
+  openstack role add --project demo --user demo user
+  Any roles that you create must map to roles specified in the policy.json file in the configuration file directory of each OpenStack service. The default policy for most services grants administrative access to the admin role. For more information, see the Operations Guide - Managing Projects and Users.
+  Verify operation
+  unset OS_TOKEN OS_URL(pre-src.sh生成的)
+  openstack --os-auth-url http://192.168.56.11:35357/v3 --os-project-domain-name default --os-user-domain-name default --os-project-name admin --os-username admin token issue
+  Password: 
+  +------------+--------------------------------------------------------------------------------------------------------------------------------------------------------+
+  | Field      | Value                                                                                                                                                  |
+  +------------+--------------------------------------------------------------------------------------------------------------------------------------------------------+
+  | expires    | 2016-06-19T08:58:41.668574Z                                                                                                                            |
+  | id         | gAAAAABXZlCy1ixw-e4XHQJqI9ACU3B30lbaFHaiYT9GzVmM2D3s0d5hySOkfhfZnCrRquq9ld1DoVryCOERrbUYoVWnagWMLqzIfCyFhVlEIzWVeSIcE_rYLQ-wM8iRHMQhzdU3C-             |
+  |            | giybR6Awa1u43J9hXB_Lq3odhtLIEqxXqMullSqDglAMQ                                                                                                          |
+  | project_id | 6b0301e383214f1f96fdf3ea0d244a82                                                                                                                       |
+  | user_id    | 0e91c50f435a4b5db0336c3d383c1970                                                                                                                       |
+  +------------+--------------------------------------------------------------------------------------------------------------------------------------------------------+
+  
+  
+  openstack --os-auth-url http://192.168.56.11:5000/v3 --os-project-domain-name default --os-user-domain-name default --os-project-name demo --os-username demo token issue
+  Password: 
+  +------------+--------------------------------------------------------------------------------------------------------------------------------------------------------+
+  | Field      | Value                                                                                                                                                  |
+  +------------+--------------------------------------------------------------------------------------------------------------------------------------------------------+
+  | expires    | 2016-06-19T09:00:34.466494Z                                                                                                                            |
+  | id         | gAAAAABXZlEjMq2iIB2tAaasyEaJI15Jf1rHkjstVDUa-XOL0gk-                                                                                                   |
+  |            | jvItCDIPRzdM2c0btsm4PFNiYHjyFjcgUNYjv6geIMJU26TaGJEyr5_tU9GskOmExfuer2S_ELXNkUQlmJ33z5NHyPkSDlDEFks7ci165cl8deqT3Rt1yKMK7gg8A2u_OFc                    |
+  | project_id | 09d3b60c0aec4bcd803c166f2e571d5a                                                                                                                       |
+  | user_id    | 64d276bc08264ecebc7e99f0da58cfdf                                                                                                                       |
+  +------------+--------------------------------------------------------------------------------------------------------------------------------------------------------+
+  Creating the scripts
+  -- Create client environment scripts for the admin and demo projects and users. Future portions of this guide reference these scripts to load appropriate credentials for client operations.
+  
+  -- Edit the admin-openrc.sh file and add the following content:
+  
+      export OS_PROJECT_DOMAIN_NAME=default
+      export OS_USER_DOMAIN_NAME=default
+      export OS_PROJECT_NAME=admin
+      export OS_USERNAME=admin
+      export OS_PASSWORD=admin
+      export OS_AUTH_URL=http://192.168.56.11:35357/v3
+      export OS_IDENTITY_API_VERSION=3
+      export OS_IMAGE_API_VERSION=2
+  
+  -- Edit the demo-openrc.sh file and add the following content:
+  
+      export OS_PROJECT_DOMAIN_NAME=default
+      export OS_USER_DOMAIN_NAME=default
+      export OS_PROJECT_NAME=demo
+      export OS_USERNAME=demo
+      export OS_PASSWORD=demo
+      export OS_AUTH_URL=http://192.168.56.11:5000/v3
+      export OS_IDENTITY_API_VERSION=3
+      export OS_IMAGE_API_VERSION=2    
+  
+  . admin-openrc.sh
+  openstack token issue
+  +------------+--------------------------------------------------------------------------------------------------------------------------------------------------------+
+  | Field      | Value                                                                                                                                                  |
+  +------------+--------------------------------------------------------------------------------------------------------------------------------------------------------+
+  | expires    | 2016-06-19T09:07:54.547831Z                                                                                                                            |
+  | id         | gAAAAABXZlLbMzIyp1dVMC6x_cHnx-yvZz4DraomuXyVvvDEcpNKTyEXRLKEwMVxoBvF85-pkfJdcLSrGCf6VQ7CcEQCys6PijGopeoAsdJ2maKxWy4NedDRxaww2dic-                      |
+  |            | tIpPjcAN1oa1xTGGmvvlFUujy275gwHIh-iAwM3yQPFEJQYg-cDuWM                                                                                                 |
+  | project_id | 6b0301e383214f1f96fdf3ea0d244a82                                                                                                                       |
+  | user_id    | 0e91c50f435a4b5db0336c3d383c1970                                                                                                                       |
+  +------------+--------------------------------------------------------------------------------------------------------------------------------------------------------+
+  此处可以分发token说明keystone服务配置完成.
+  
+Glance --- Image service
+
+  installation
+    yum install -y openstack-glance python-glance python-glanceclient
+  prequisites
+    Create the glance database:
+        CREATE DATABASE glance;
+        
+    Grant proper access to the glance database:
+        GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'localhost' IDENTIFIED BY 'glance';
+        GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'%' IDENTIFIED BY 'glance';
+        
+  create
+  
+  openstack user create --domain default --password-prompt glance
+  User Password:
+  Repeat User Password:
+  +-----------+----------------------------------+
+  | Field     | Value                            |
+  +-----------+----------------------------------+
+  | domain_id | 87c15d93437c41e4b43b1658bfbdfd63 |
+  | enabled   | True                             |
+  | id        | 89f01133cfb8496f8c5f02c6a3e2e93a |
+  | name      | glance                           |
+  +-----------+----------------------------------+
+  # 赋予glance用户admin角色
+  openstack role add --project service --user glance admin
+  
+  
+  # 注册glance服务到keystone
+  openstack service create --name glance --description "OpenStack Image" image
+  +-------------+----------------------------------+
+  | Field       | Value                            |
+  +-------------+----------------------------------+
+  | description | OpenStack Image                  |
+  | enabled     | True                             |
+  | id          | 27cc733b5bdf4be7b0fdd652714007e9 |
+  | name        | glance                           |
+  | type        | image                            |
+  +-------------+----------------------------------+    
+  
+  # 创建glance服务访问endpoint API
+  
+  Create the Image service API endpoints:
+  
+  openstack endpoint create --region RegionOne image public http://192.168.56.11:9292
+  +--------------+----------------------------------+
+  | Field        | Value                            |
+  +--------------+----------------------------------+
+  | enabled      | True                             |
+  | id           | cb43cf55f0c3478884bc59a2ec5e9236 |
+  | interface    | public                           |
+  | region       | RegionOne                        |
+  | region_id    | RegionOne                        |
+  | service_id   | 27cc733b5bdf4be7b0fdd652714007e9 |
+  | service_name | glance                           |
+  | service_type | image                            |
+  | url          | http://192.168.56.11:9292        |
+  +--------------+----------------------------------+
+  openstack endpoint create --region RegionOne image internal http://192.168.56.11:9292
+  +--------------+----------------------------------+
+  | Field        | Value                            |
+  +--------------+----------------------------------+
+  | enabled      | True                             |
+  | id           | d217c928217d4f4786e7cb6af3b3b19b |
+  | interface    | internal                         |
+  | region       | RegionOne                        |
+  | region_id    | RegionOne                        |
+  | service_id   | 27cc733b5bdf4be7b0fdd652714007e9 |
+  | service_name | glance                           |
+  | service_type | image                            |
+  | url          | http://192.168.56.11:9292        |
+  +--------------+----------------------------------+
+  openstack endpoint create --region RegionOne image admin http://192.168.56.11:9292
+  +--------------+----------------------------------+
+  | Field        | Value                            |
+  +--------------+----------------------------------+
+  | enabled      | True                             |
+  | id           | 37d762f601aa4f4e8d36dc7877055308 |
+  | interface    | admin                            |
+  | region       | RegionOne                        |
+  | region_id    | RegionOne                        |
+  | service_id   | 27cc733b5bdf4be7b0fdd652714007e9 |
+  | service_name | glance                           |
+  | service_type | image                            |
+  | url          | http://192.168.56.11:9292        |
+  +--------------+----------------------------------+
+  /etc/glance/glance-api.conf
+  [DEFAULT]
+  verbose=True
+  notification_driver = noop
+  
+  In the [database] section, configure database access:
+  
+      [database]
+      ...
+      connection = mysql//glance:glance@192.168.56.11/glance
+  
+  In the [keystone_authtoken] and [paste_deploy] sections, configure Identity service access:
+  
+      [keystone_authtoken]
+      auth_uri = http://192.168.56.11:5000
+      auth_url = http://192.168.56.11:35357
+      auth_plugin = password
+      project_domain_id = default
+      user_domain_id = default
+      project_name = service
+      username = glance
+      password = glance
+      
+      [paste_deploy]
+      ...
+      flavor = keystone
+  
+  # Note
+  # Comment out or remove any other options in the [keystone_authtoken] section.
+  
+  In the [glance_store] section, configure the local file system store and location of image files:
+  
+      [glance_store]
+      default_store = file   # 默认使用file存储镜像
+      filesystem_store_datadir = /var/lib/glance/images/
+  /etc/glance/glance-registry.conf
+  [DEFAULT]
+  verbose=True
+  notification_driver = noop
+  
+  In the [database] section, configure database access:
+  
+      [database]
+      ...
+      connection = mysql://glance:glance@192.168.56.11/glance
+  
+  In the [keystone_authtoken] and [paste_deploy] sections, configure Identity service access:
+  
+      [keystone_authtoken]
+      auth_uri = http://192.168.56.11:5000
+      auth_url = http://192.168.56.11:35357
+      auth_plugin = password
+      project_domain_id = default
+      user_domain_id = default
+      project_name = service
+      username = glance
+      password = glance
+  
+      
+      [paste_deploy]
+      ...
+      flavor = keystone
+  Populate the Image service database:
+  su -s /bin/sh -c "glance-manage db_sync" glance
+  Verify Operations
+  systemctl enable openstack-glance-api.service openstack-glance-registry.service
+  systemctl start openstack-glance-api.service openstack-glance-registry.service
+  
+      echo "export OS_IMAGE_API_VERSION=2" |tee -a admin-openrc demp-openrc
+      . admin-openrc.sh
+      wget http://download.cirros-cloud.net/0.3.4/cirros-0.3.4-x86_64-disk.img
+  # Upload the image to the Image service using the QCOW2 disk format, bare container format, and public visibility so all projects can access it
+  
+  glance image-create --name "cirros" --file cirros-0.3.4-x86_64-disk.img --disk-format qcow2 --container-format bare --visibility public --progress
+  [=============================>] 100%
+  +------------------+--------------------------------------+
+  | Property         | Value                                |
+  +------------------+--------------------------------------+
+  | checksum         | ee1eca47dc88f4879d8a229cc70a07c6     |
+  | container_format | bare                                 |
+  | created_at       | 2016-08-25T08:18:12Z                 |
+  | disk_format      | qcow2                                |
+  | id               | 9cab5754-bc51-437c-8028-7e07ac17ccc9 |
+  | min_disk         | 0                                    |
+  | min_ram          | 0                                    |
+  | name             | cirros                               |
+  | owner            | 52958cb6a7034eb9aa52ae9daa37bb50     |
+  | protected        | False                                |
+  | size             | 13287936                             |
+  | status           | active                               |
+  | tags             | []                                   |
+  | updated_at       | 2016-08-25T08:18:13Z                 |
+  | virtual_size     | None                                 |
+  | visibility       | public                               |
+  +------------------+--------------------------------------+
+  
+  openstack image list
+  +--------------------------------------+--------+--------+
+  | ID                                   | Name   | Status |
+  +--------------------------------------+--------+--------+
+  | be55631b-e3bc-4ba5-bd4c-f8fda6b5cd57 | cirros | active |
+  +--------------------------------------+--------+--------+
+      
+  至此Glance服务配置完成.
+  
+Nova --- Compute service
+
+  prequisites(controller)
+    Create the nova database:
+        CREATE DATABASE nova;
+        
+    Grant proper access to the glance database:
+        GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'localhost' \
+          IDENTIFIED BY 'NOVA_DBPASS';
+        GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'%' \
+          IDENTIFIED BY 'NOVA_DBPASS';
+          
+  create(controller)
+  
+  . admin-openrc.sh
+  openstack user create --domain default --password-prompt nova
+  User Password:
+  Repeat User Password:
+  +-----------+----------------------------------+
+  | Field     | Value                            |
+  +-----------+----------------------------------+
+  | domain_id | e0353a670a9e496da891347c589539e9 |
+  | enabled   | True                             |
+  | id        | 8c46e4760902464b889293a74a0c90a8 |
+  | name      | nova                             |
+  +-----------+----------------------------------+
+  # 赋予nova用户admin角色
+  openstack role add --project service --user nova admin
+  
+  # 注册nova服务到keystone
+  openstack service create --name nova --description "OpenStack Compute" compute
+  +-------------+----------------------------------+
+  | Field       | Value                            |
+  +-------------+----------------------------------+
+  | description | OpenStack Compute                |
+  | enabled     | True                             |
+  | id          | 060d59eac51b4594815603d75a00aba2 |
+  | name        | nova                             |
+  | type        | compute                          |
+  +-------------+----------------------------------+
+  # 创建nova服务访问endpoint API
+  
+  Create the Compute service API endpoints:
+  
+  openstack endpoint create --region RegionOne compute public http://192.168.56.11:8774/v2/%\(tenant_id\)s
+  +--------------+----------------------------------------------+
+  | Field        | Value                                        |
+  +--------------+----------------------------------------------+
+  | enabled      | True                                         |
+  | id           | 3c1caa473bfe4390a11e7177894bcc7b             |
+  | interface    | public                                       |
+  | region       | RegionOne                                    |
+  | region_id    | RegionOne                                    |
+  | service_id   | e702f6f497ed42e6a8ae3ba2e5871c78             |
+  | service_name | nova                                         |
+  | service_type | compute                                      |
+  | url          | http://192.168.56.11:8774/v2.1/%(tenant_id)s |
+  +--------------+----------------------------------------------+
+  
+  openstack endpoint create --region RegionOne compute internal http://192.168.56.11:8774/v2/%\(tenant_id\)s
+  +--------------+----------------------------------------------+
+  | Field        | Value                                        |
+  +--------------+----------------------------------------------+
+  | enabled      | True                                         |
+  | id           | e3c918de680746a586eac1f2d9bc10ab             |
+  | interface    | internal                                     |
+  | region       | RegionOne                                    |
+  | region_id    | RegionOne                                    |
+  | service_id   | e702f6f497ed42e6a8ae3ba2e5871c78             |
+  | service_name | nova                                         |
+  | service_type | compute                                      |
+  | url          | http://192.168.56.11:8774/v2.1/%(tenant_id)s |
+  +--------------+----------------------------------------------+
+  
+  openstack endpoint create --region RegionOne compute admin http://192.168.56.11:8774/v2/%\(tenant_id\)s
+  +--------------+----------------------------------------------+
+  | Field        | Value                                        |
+  +--------------+----------------------------------------------+
+  | enabled      | True                                         |
+  | id           | 38f7af91666a47cfb97b4dc790b94424             |
+  | interface    | admin                                        |
+  | region       | RegionOne                                    |
+  | region_id    | RegionOne                                    |
+  | service_id   | e702f6f497ed42e6a8ae3ba2e5871c78             |
+  | service_name | nova                                         |
+  | service_type | compute                                      |
+  | url          | http://192.168.56.11:8774/v2.1/%(tenant_id)s |
+  +--------------+----------------------------------------------+
+  install and configure components
+  controller
+      yum install openstack-nova-api openstack-nova-cert openstack-nova-conductor openstack-nova-console openstack-nova-novncproxy openstack-nova-scheduler python-novaclient
+  compute
+      yum install -y openstack-nova-compute sysfsutils
+  /etc/nova/nova.conf (controller)
+  [DEFAULT]
+  my_ip=192.168.56.11
+  network_api_class = nova.network.neutronv2.api.API
+  security_group_api = neutron
+  linuxnet_interface_driver = nova.network.linux_net.NeutronLinuxBridgeInterfaceDriver
+  firewall_driver = nova.virt.firewall.NoopFirewallDriver
+  enabled_apis=osapi_compute,metadata
+  auth_strategy=keystone
+  verbose=true
+  rpc_backend=rabbit
+  
+  [database]
+  connection = mysql://nova:nova@192.168.56.11/nova
+  
+  [glance]
+  host = 192.168.56.11
+  
+  [keystone_authtoken]
+  auth_uri = http://192.168.56.11:5000
+  auth_url = http://192.168.56.11:35357
+  auth_plugin = password
+  project_domain_id = default
+  user_domain_id = default
+  project_name = service
+  username = nova
+  password = nova
+  
+  [neutron]
+  url = http://192.168.56.11:9696
+  auth_url = http://192.168.56.11:35357
+  auth_plugin = password
+  project_domain_id = default
+  user_domain_id = default
+  region_name = RegionOne
+  project_name = service
+  username = neutron
+  password = neutron
+  service_metadata_proxy = True
+  metadata_proxy_shared_secret = 123456
+  
+  [vnc]
+  vncserver_listen = $my_ip
+  vncserver_proxyclient_address = $my_ip
+  
+  su -s /bin/sh -c "nova-manage db sync" nova
+  /etc/nova/nova.conf (compute)
+  [DEFAULT]
+  network_api_class = nova.network.neutronv2.api.API
+  security_group_api = neutron
+  linuxnet_interface_driver = nova.network.linux_net.NeutronLinuxBridgeInterfaceDriver
+  firewall_driver = nova.virt.firewall.NoopFirewallDriver
+  my_ip=192.168.56.12
+  auth_strategy=keystone
+  verbose=true
+  rpc_backend=rabbit
+  
+  [glance]
+  host=192.168.56.11
+  
+  [keystone_authtoken]
+  auth_uri = http://192.168.56.11:5000
+  auth_url = http://192.168.56.11:35357
+  auth_plugin = password
+  project_domain_id = default
+  user_domain_id = default
+  project_name = service
+  username = nova
+  password = nova
+  
+  [oslo_concurrency]
+  lock_path=/var/lib/nova/tmp
+  
+  [oslo_messaging_rabbit]
+  rabbit_host = 192.168.56.11
+  rabbit_userid = openstack
+  rabbit_password = openstack
+  
+  [vnc]
+  enabled = True
+  vncserver_listen = 0.0.0.0
+  vncserver_proxyclient_address = $my_ip
+  novncproxy_base_url = http://192.168.56.11:6080/vnc_auto.html
+  Neutron --- Network service
+  
+  installation --- provider network
+  controller
+      yum install openstack-neutron openstack-neutron-ml2 openstack-neutron-linuxbridge python-neutronclient ebtables ipset
+  compute
+      yum install openstack-neutron openstack-neutron-linuxbridge ebtables ipset
+  configuration
+  CREATE DATABASE neutron;
+  GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'localhost' IDENTIFIED BY 'neutron';
+  GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'%'  IDENTIFIED BY 'neutron';
+  
+  . admin-openrc.sh
+  
+  openstack user create --domain default --password-prompt neutron
+  User Password:
+  Repeat User Password:
+  +-----------+----------------------------------+
+  | Field     | Value                            |
+  +-----------+----------------------------------+
+  | domain_id | e0353a670a9e496da891347c589539e9 |
+  | enabled   | True                             |
+  | id        | b20a6692f77b4258926881bf831eb683 |
+  | name      | neutron                          |
+  +-----------+----------------------------------+
+  
+  openstack role add --project service --user neutron admin
+  
+  openstack service create --name neutron --description "OpenStack Networking" network
+  +-------------+----------------------------------+
+  | Field       | Value                            |
+  +-------------+----------------------------------+
+  | description | OpenStack Networking             |
+  | enabled     | True                             |
+  | id          | f71529314dab4a4d8eca427e701d209e |
+  | name        | neutron                          |
+  | type        | network                          |
+  +-------------+----------------------------------+
+  # 创建neutron服务访问endpoint API
+  
+  Create the Network service API endpoints:
+  
+  openstack endpoint create --region RegionOne network public http://192.168.56.11:9696
+  +--------------+-------------------------------------+
+  | Field        | Value                               |
+  +--------------+-------------------------------------+
+  | enabled      | True                                |
+  | id           | 85d80a6d02fc4b7683f611d7fc1493a3    |
+  | interface    | public                              |
+  | region       | RegionOne                           |
+  | region_id    | RegionOne                           |
+  | service_id   | f71529314dab4a4d8eca427e701d209e    |
+  | service_name | neutron                             |
+  | service_type | network                             |
+  | url          | http://192.168.56.11:9696           |
+  +--------------+-------------------------------------+
+  
+  openstack endpoint create --region RegionOne \
+    network internal http://192.168.56.11:9696
+  +--------------+-------------------------------------+
+  | Field        | Value                               |
+  +--------------+-------------------------------------+
+  | enabled      | True                                |
+  | id           | 09753b537ac74422a68d2d791cf3714f    |
+  | interface    | internal                            |
+  | region       | RegionOne                           |
+  | region_id    | RegionOne                           |
+  | service_id   | f71529314dab4a4d8eca427e701d209e    |
+  | service_name | neutron                             |
+  | service_type | network                             |
+  | url          | http://192.168.56.11:9696           |
+  +--------------+-------------------------------------+
+  
+  openstack endpoint create --region RegionOne \
+    network admin http://192.168.56.11:9696
+  +--------------+-------------------------------------+
+  | Field        | Value                               |
+  +--------------+-------------------------------------+
+  | enabled      | True                                |
+  | id           | 1ee14289c9374dffb5db92a5c112fc4e    |
+  | interface    | admin                               |
+  | region       | RegionOne                           |
+  | region_id    | RegionOne                           |
+  | service_id   | f71529314dab4a4d8eca427e701d209e    |
+  | service_name | neutron                             |
+  | service_type | network                             |
+  | url          | http://192.168.56.11:9696           |
+  +--------------+-------------------------------------+
+  /etc/neutron/metadata_agent.ini
+  [DEFAULT]
+  auth_uri = http://192.168.56.11:5000
+  auth_url = http://192.168.56.11:35357
+  auth_region = RegionOne
+  auth_plugin = password
+  project_domain_id = default
+  user_domain_id = default
+  project_name = service
+  username = neutron
+  password = neutron
+  nova_metadata_ip = 192.168.56.11
+  metadata_proxy_shared_secret = 123456  --> /etc/nova/nova.conf (controller)
+  debug = True
+  /etc/neutron/neutron.conf (controller)
+  [DEFAULT]
+  auth_strategy = keystone
+  core_plugin = ml2
+  service_plugins =
+  rpc_backend = rabbit
+  notify_nova_on_port_status_changes = True
+  notify_nova_on_port_data_changes = True
+  nova_url = http://192.168.56.11:8774/v2
+  verbose = True
+  
+  [keystone_authtoken]
+  auth_uri = http://192.168.56.11:5000
+  auth_url = http://192.168.56.11:35357
+  auth_plugin = password
+  project_domain_id = default
+  user_domain_id = default
+  project_name = service
+  username = neutron
+  password = neutron
+  
+  [database]
+  connection = mysql://neutron:neutron@192.168.56.11/neutron
+  
+  [nova]
+  auth_url = http://192.168.56.11:35357
+  auth_plugin = password
+  project_domain_id = default
+  user_domain_id = default
+  region_name = RegionOne
+  project_name = service
+  username = nova
+  password = nova
+  
+  [oslo_concurrency]
+  lock_path = /var/lib/neutron/tmp
+  
+  [oslo_messaging_rabbit]
+  rabbit_host = 192.168.56.11
+  rabbit_userid = openstack
+  rabbit_password = openstack
+  /etc/neutron/plugins/ml2/linuxbridge_agent.ini (controller)
+  [linux_bridge]
+  physical_interface_mappings = public:eth0
+  
+  [vxlan]
+  enable_vxlan = False
+  
+  [agent]
+  prevent_arp_spoofing = True
+  
+  [securitygroup]
+  enable_security_group = True
+  firewall_driver = neutron.agent.linux.iptables_firewall.IptablesFirewallDriver
+  /etc/neutron/plugins/ml2/ml2_conf.ini (controller)
+  [ml2]
+  type_drivers = flat,vlan
+  tenant_network_types =
+  mechanism_drivers = linuxbridge
+  extension_drivers = port_security
+  
+  [ml2_type_flat]
+  flat_networks = public
+  
+  [securitygroup]
+  enable_ipset = True
+  /etc/neutron/neutron.conf (compute)
+  [DEFAULT]
+  auth_strategy = keystone
+  rpc_backend = rabbit
+  
+  [keystone_authtoken]
+  auth_uri = http://192.168.56.11:5000
+  auth_url = http://192.168.56.11:35357
+  memcached_servers = 192.168.56.11:11211
+  auth_type = password
+  project_domain_name = default
+  user_domain_name = default
+  project_name = service
+  username = neutron
+  password = neutron
+  
+  [oslo_concurrency]
+  lock_path = /var/lib/neutron/tmp
+  
+  [oslo_messaging_rabbit]
+  rabbit_host = 192.168.56.11
+  rabbit_userid = openstack
+  rabbit_password = openstack
+  /etc/neutron/plugins/ml2/linuxbridge_agent.ini (compute)
+  [DEFAULT]
+  physical_interface_mappings = provider:eth0
+  
+  [securitygroup]
+  enable_security_group = True
+  firewall_driver = neutron.agent.linux.iptables_firewall.IptablesFirewallDriver
+  
+  [vxlan]
+  enable_vxlan = False
+  final
+  ln -s /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugin.ini
+  
+  su -s /bin/sh -c "neutron-db-manage --config-file /etc/neutron/neutron.conf --config-file /etc/neutron/plugins/ml2/ml2_conf.ini upgrade head" neutron
+  
+  controller
+      systemctl start openstack-nova-api.service \
+        openstack-nova-cert.service openstack-nova-consoleauth.service \
+        openstack-nova-scheduler.service openstack-nova-conductor.service openstack-nova-novncproxy.service
+      
+      systemctl start neutron-server.service \
+        neutron-linuxbridge-agent.service neutron-dhcp-agent.service \
+        neutron-metadata-agent.service
+  
+  compute  
+      systemctl start libvirtd.service openstack-nova-compute.service
+      
+      systemctl start neutron-linuxbridge-agent.service
+  verify
+  . admin-openrc.sh
+  
+  openstack compute service list
+  +------------------+-------+----------+---------+-------+----------------------------+
+  | Binary           | Host  | Zone     | Status  | State | Updated At                 |
+  +------------------+-------+----------+---------+-------+----------------------------+
+  | nova-consoleauth | node1 | internal | enabled | up    | 2016-08-25T09:47:22.000000 |
+  | nova-cert        | node1 | internal | enabled | up    | 2016-08-25T09:47:22.000000 |
+  | nova-conductor   | node1 | internal | enabled | up    | 2016-08-25T09:47:22.000000 |
+  | nova-scheduler   | node1 | internal | enabled | up    | 2016-08-25T09:47:22.000000 |
+  | nova-compute     | node2 | nova     | enabled | up    | 2016-08-25T09:47:25.000000 |
+  +------------------+-------+----------+---------+-------+----------------------------+
+  
+  nova service-list
+  '+----+------------------+-------+----------+---------+-------+----------------------------+-----------------+
+  | Id | Binary           | Host  | Zone     | Status  | State | Updated_at                 | Disabled Reason |
+  +----+------------------+-------+----------+---------+-------+----------------------------+-----------------+
+  | 1  | nova-consoleauth | node1 | internal | enabled | up    | 2016-08-25T09:47:52.000000 | -               |
+  | 2  | nova-cert        | node1 | internal | enabled | up    | 2016-08-25T09:47:52.000000 | -               |
+  | 3  | nova-conductor   | node1 | internal | enabled | up    | 2016-08-25T09:47:52.000000 | -               |
+  | 4  | nova-scheduler   | node1 | internal | enabled | up    | 2016-08-25T09:47:52.000000 | -               |
+  | 5  | nova-compute     | node2 | nova     | enabled | up    | 2016-08-25T09:47:45.000000 | -               |
+  +----+------------------+-------+----------+---------+-------+----------------------------+-----------------+
+  
+  
+  neutron agent-list
+  +--------------------------------------+--------------------+-------+-------+----------------+---------------------------+
+  | id                                   | agent_type         | host  | alive | admin_state_up | binary                    |
+  +--------------------------------------+--------------------+-------+-------+----------------+---------------------------+
+  | 4868b387-aab5-42b1-9468-380fa0dea71a | DHCP agent         | node1 | :-)   | True           | neutron-dhcp-agent        |
+  | 7ac47e3f-9725-4617-b9e0-9984ee612ca6 | Linux bridge agent | node1 | :-)   | True           | neutron-linuxbridge-agent |
+  | 7d1ae860-1fc9-479a-a1a0-63b0aae6071a | Linux bridge agent | node2 | :-)   | True           | neutron-linuxbridge-agent |
+  | d73a4b71-9fdd-4680-88a6-63c3f40c85a5 | Metadata agent     | node1 | :-)   | True           | neutron-metadata-agent    |
+  +--------------------------------------+--------------------+-------+-------+----------------+---------------------------+
